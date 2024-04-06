@@ -10,14 +10,14 @@
 
 typedef struct elf_info_t {
   spike_file_t *f;
-  struct process *p;
+  process *p;
 } elf_info;
 
 //
 // the implementation of allocater. allocates memory space for later segment loading
 //
 static void *elf_alloc_mb(elf_ctx *ctx, uint64 elf_pa, uint64 elf_va, uint64 size) {
-  // directly returns the virtual address as we are in the Bare mode in lab1
+  // directly returns the virtual address as we are in the Bare mode in lab1_x
   return (void *)elf_va;
 }
 
@@ -26,7 +26,9 @@ static void *elf_alloc_mb(elf_ctx *ctx, uint64 elf_pa, uint64 elf_va, uint64 siz
 //
 static uint64 elf_fpread(elf_ctx *ctx, void *dest, uint64 nb, uint64 offset) {
   elf_info *msg = (elf_info *)ctx->info;
-  // call spike file utility
+  // call spike file utility to load the content of elf file into memory.
+  // spike_file_pread will read the elf file (msg->f) from offset to memory (indicated by
+  // *dest) for nb bytes.
   return spike_file_pread(msg->f, dest, nb, offset);
 }
 
@@ -44,6 +46,7 @@ elf_status elf_init(elf_ctx *ctx, void *info) {
 
   return EL_OK;
 }
+
 // leb128 (little-endian base 128) is a variable-length
 // compression algoritm in DWARF
 void read_uleb128(uint64 *out, char **off) {
@@ -87,8 +90,9 @@ void read_uint16(uint16 *out, char **off) {
         *out |= (uint16)(**off) << (i << 3); (*off)++;
     }
 }
+
 /*
-* analyzis the data in the debug_line section
+* analyze the data in the debug_line section
 *
 * the function needs 3 parameters: elf context, data in the debug_line section
 * and length of debug_line section
@@ -100,7 +104,7 @@ void read_uint16(uint16 *out, char **off) {
 * and their code file name index of array "file"
 */
 void make_addr_line(elf_ctx *ctx, char *debug_line, uint64 length) {
-	process *p = ((elf_info *)ctx->info)->p;
+   process *p = ((elf_info *)ctx->info)->p;
     p->debugline = debug_line;
     // directory name char pointer array
     p->dir = (char **)((((uint64)debug_line + length + 7) >> 3) << 3); int dir_ind = 0, dir_base;
@@ -135,8 +139,9 @@ void make_addr_line(elf_ctx *ctx, char *debug_line, uint64 length) {
                         case 1: // DW_LNE_end_sequence
                             if (p->line_ind > 0 && p->line[p->line_ind - 1].addr == regs.addr) p->line_ind--;
                             p->line[p->line_ind] = regs; p->line[p->line_ind].file += file_base - 1;
-                            p->line_ind++; goto endop;
-                        case 2: // DW_LNE_set_address 
+                            p->line_ind++;
+                            goto endop;
+                        case 2: // DW_LNE_set_address
                             read_uint64(&regs.addr, &off); break;
                         // ignore DW_LNE_define_file
                         case 4: // DW_LNE_set_discriminator
@@ -186,15 +191,17 @@ void make_addr_line(elf_ctx *ctx, char *debug_line, uint64 length) {
         }
 endop:;
     }
-    // for (int i = 0; i < p->line_ind; i++)
-    //     sprint("%p %d %d\n", p->line[i].addr, p->line[i].line, p->line[i].file);
+
 }
+
 //
 // load the elf segments to memory regions as we are in Bare mode in lab1
 //
 elf_status elf_load(elf_ctx *ctx) {
+  // elf_prog_header structure is defined in kernel/elf.h
   elf_prog_header ph_addr;
   int i, off;
+  uint64 maxva = 0;
   // traverse the elf program segment headers
   for (i = 0, off = ctx->ehdr.phoff; i < ctx->ehdr.phnum; i++, off += sizeof(ph_addr)) {
     // read segment headers
@@ -204,15 +211,32 @@ elf_status elf_load(elf_ctx *ctx) {
     if (ph_addr.memsz < ph_addr.filesz) return EL_ERR;
     if (ph_addr.vaddr + ph_addr.memsz < ph_addr.vaddr) return EL_ERR;
 
-    // allocate memory before loading
+    // allocate memory block before elf loading
     void *dest = elf_alloc_mb(ctx, ph_addr.vaddr, ph_addr.vaddr, ph_addr.memsz);
 
     // actual loading
     if (elf_fpread(ctx, dest, ph_addr.memsz, ph_addr.off) != ph_addr.memsz)
       return EL_EIO;
+    if (ph_addr.vaddr + ph_addr.memsz > maxva) maxva = ph_addr.vaddr + ph_addr.memsz;
   }
-
+  char name[16];
+  ((elf_info *)ctx->info)->p->debugline = NULL;
+  elf_sect_header name_segment, temp_segment;
+  if (elf_fpread(ctx, (void *)&name_segment, sizeof(name_segment), ctx->ehdr.shoff + ctx->ehdr.shstrndx * sizeof(name_segment)) != sizeof(name_segment))
+    return EL_EIO;
+  for (i = 0, off = ctx->ehdr.shoff; i < ctx->ehdr.shnum; i++, off += sizeof(temp_segment)) {
+    if (elf_fpread(ctx, (void *)&temp_segment, sizeof(temp_segment), off) != sizeof(temp_segment))
+        return EL_EIO;
+    elf_fpread(ctx, (void *)name, 20, name_segment.offset + temp_segment.name);
+    if (strcmp(name, ".debug_line") == 0) {
+        if (elf_fpread(ctx, (void *)maxva, temp_segment.size, temp_segment.offset) != temp_segment.size)
+            return EL_EIO;
+        make_addr_line(ctx, (char *)maxva, temp_segment.size);
+        break;
+       }
+   }
   return EL_OK;
+
 }
 
 typedef union {
@@ -244,7 +268,7 @@ static size_t parse_args(arg_buf *arg_bug_msg) {
 //
 // load the elf of user application, by using the spike file interface.
 //
-void load_bincode_from_host_elf(struct process *p) {
+void load_bincode_from_host_elf(process *p) {
   arg_buf arg_bug_msg;
 
   // retrieve command line arguements
@@ -253,25 +277,27 @@ void load_bincode_from_host_elf(struct process *p) {
 
   sprint("Application: %s\n", arg_bug_msg.argv[0]);
 
-  //elf loading
+  //elf loading. elf_ctx is defined in kernel/elf.h, used to track the loading process.
   elf_ctx elfloader;
+  // elf_info is defined above, used to tie the elf file and its corresponding process.
   elf_info info;
 
   info.f = spike_file_open(arg_bug_msg.argv[0], O_RDONLY, 0);
   info.p = p;
+  // IS_ERR_VALUE is a macro defined in spike_interface/spike_htif.h
   if (IS_ERR_VALUE(info.f)) panic("Fail on openning the input application program.\n");
 
-  // init elfloader
+  // init elfloader context. elf_init() is defined above.
   if (elf_init(&elfloader, &info) != EL_OK)
     panic("fail to init elfloader.\n");
 
-  // load elf
+  // load elf. elf_load() is defined above.
   if (elf_load(&elfloader) != EL_OK) panic("Fail on loading elf.\n");
 
-  // entry (virtual) address
+  // entry (virtual, also physical in lab1_x) address
   p->trapframe->epc = elfloader.ehdr.entry;
 
-  // close host file
+  // close the host spike file
   spike_file_close( info.f );
 
   sprint("Application program entry point (virtual address): 0x%lx\n", p->trapframe->epc);

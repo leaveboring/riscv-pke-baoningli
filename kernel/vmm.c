@@ -3,26 +3,30 @@
  */
 
 #include "vmm.h"
-#include "riscv.h"
-#include "pmm.h"
-#include "util/types.h"
 #include "memlayout.h"
-#include "util/string.h"
+#include "pmm.h"
+#include "process.h"
+#include "riscv.h"
 #include "spike_interface/spike_utils.h"
 #include "util/functions.h"
+#include "util/string.h"
+#include "util/types.h"
 
 /* --- utility functions for virtual address mapping --- */
 //
-// establish mapping of virtual address [va, va+size] to phyiscal address [pa, pa+size]
-// with the permission of "perm".
+// establish mapping of virtual address [va, va+size] to phyiscal address [pa,
+// pa+size] with the permission of "perm".
 //
-int map_pages(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+int init_heap = 0;
+int map_pages(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa,
+              int perm) {
   uint64 first, last;
   pte_t *pte;
 
   for (first = ROUNDDOWN(va, PGSIZE), last = ROUNDDOWN(va + size - 1, PGSIZE);
-      first <= last; first += PGSIZE, pa += PGSIZE) {
-    if ((pte = page_walk(page_dir, first, 1)) == 0) return -1;
+       first <= last; first += PGSIZE, pa += PGSIZE) {
+    if ((pte = page_walk(page_dir, first, 1)) == 0)
+      return -1;
     if (*pte & PTE_V)
       panic("map_pages fails on mapping va (0x%lx) to pa (0x%lx)", first, pa);
     *pte = PA2PTE(pa) | perm | PTE_V;
@@ -35,20 +39,26 @@ int map_pages(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm)
 //
 uint64 prot_to_type(int prot, int user) {
   uint64 perm = 0;
-  if (prot & PROT_READ) perm |= PTE_R | PTE_A;
-  if (prot & PROT_WRITE) perm |= PTE_W | PTE_D;
-  if (prot & PROT_EXEC) perm |= PTE_X | PTE_A;
-  if (perm == 0) perm = PTE_R;
-  if (user) perm |= PTE_U;
+  if (prot & PROT_READ)
+    perm |= PTE_R | PTE_A;
+  if (prot & PROT_WRITE)
+    perm |= PTE_W | PTE_D;
+  if (prot & PROT_EXEC)
+    perm |= PTE_X | PTE_A;
+  if (perm == 0)
+    perm = PTE_R;
+  if (user)
+    perm |= PTE_U;
   return perm;
 }
 
 //
-// traverse the page table (starting from page_dir) to find the corresponding pte of va.
-// returns: PTE (page table entry) pointing to va.
+// traverse the page table (starting from page_dir) to find the corresponding
+// pte of va. returns: PTE (page table entry) pointing to va.
 //
 pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc) {
-  if (va >= MAXVA) panic("page_walk");
+  if (va >= MAXVA)
+    panic("page_walk");
 
   // starting from the page directory
   pagetable_t pt = page_dir;
@@ -61,19 +71,19 @@ pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc) {
     // "pte" points to the entry of current level
     pte_t *pte = pt + PX(level, va);
 
-    // now, we need to know if above pte is valid (established mapping to phyiscal page)
-    // or not.
-    if (*pte & PTE_V) {  //PTE valid
+    // now, we need to know if above pte is valid (established mapping to a
+    // phyiscal page) or not.
+    if (*pte & PTE_V) { // PTE valid
       // phisical address of pagetable of next level
       pt = (pagetable_t)PTE2PA(*pte);
-    } else { //PTE invalid (not exist).
+    } else { // PTE invalid (not exist).
       // allocate a page (to be the new pagetable), if alloc == 1
-      if( alloc && ((pt = (pte_t *)alloc_page(1)) != 0) ){
+      if (alloc && ((pt = (pte_t *)alloc_page(1)) != 0)) {
         memset(pt, 0, PGSIZE);
-        // writes the physical address of newly allocated page to pte, to establish the
-        // page table tree.
+        // writes the physical address of newly allocated page to pte, to
+        // establish the page table tree.
         *pte = PA2PTE(pt) | PTE_V;
-      }else //returns NULL, if alloc == 0, or no more physical page remains
+      } else // returns NULL, if alloc == 0, or no more physical page remains
         return 0;
     }
   }
@@ -83,16 +93,19 @@ pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc) {
 }
 
 //
-// look up a virtual page address, return the physical page address or 0 if not mapped.
+// look up a virtual page address, return the physical page address or 0 if not
+// mapped.
 //
 uint64 lookup_pa(pagetable_t pagetable, uint64 va) {
   pte_t *pte;
   uint64 pa;
 
-  if (va >= MAXVA) return 0;
+  if (va >= MAXVA)
+    return 0;
 
   pte = page_walk(pagetable, va, 0);
-  if (pte == 0 || (*pte & PTE_V) == 0 || ((*pte & PTE_R) == 0 && (*pte & PTE_W) == 0))
+  if (pte == 0 || (*pte & PTE_V) == 0 ||
+      ((*pte & PTE_R) == 0 && (*pte & PTE_W) == 0))
     return 0;
   pa = PTE2PA(*pte);
 
@@ -100,7 +113,8 @@ uint64 lookup_pa(pagetable_t pagetable, uint64 va) {
 }
 
 /* --- kernel page table part --- */
-// _etext is defined in kernel.lds, it points to the address after text and rodata segments.
+// _etext is defined in kernel.lds, it points to the address after text and
+// rodata segments.
 extern char _etext[];
 
 // pointer to kernel page director
@@ -109,62 +123,78 @@ pagetable_t g_kernel_pagetable;
 //
 // maps virtual address [va, va+sz] to [pa, pa+sz] (for kernel).
 //
-void kern_vm_map(pagetable_t page_dir, uint64 va, uint64 pa, uint64 sz, int perm) {
-  if (map_pages(page_dir, va, sz, pa, perm) != 0) panic("kern_vm_map");
+void kern_vm_map(pagetable_t page_dir, uint64 va, uint64 pa, uint64 sz,
+                 int perm) {
+  // map_pages is defined in kernel/vmm.c
+  if (map_pages(page_dir, va, sz, pa, perm) != 0)
+    panic("kern_vm_map");
 }
 
 //
 // kern_vm_init() constructs the kernel page table.
 //
 void kern_vm_init(void) {
+  // pagetable_t is defined in kernel/riscv.h. it's actually uint64*
   pagetable_t t_page_dir;
 
-  // allocate a page (t_page_dir) to be the page directory for kernel
+  // allocate a page (t_page_dir) to be the page directory for kernel.
+  // alloc_page is defined in kernel/pmm.c
   t_page_dir = (pagetable_t)alloc_page();
+  // memset is defined in util/string.c
   memset(t_page_dir, 0, PGSIZE);
 
-  // map virtual address [KERN_BASE, _etext] to physical address [DRAM_BASE, DRAM_BASE+(_etext - KERN_BASE)],
-  // to maintain (direct) text section kernel address mapping.
+  // map virtual address [KERN_BASE, _etext] to physical address [DRAM_BASE,
+  // DRAM_BASE+(_etext - KERN_BASE)], to maintain (direct) text section kernel
+  // address mapping.
   kern_vm_map(t_page_dir, KERN_BASE, DRAM_BASE, (uint64)_etext - KERN_BASE,
-         prot_to_type(PROT_READ | PROT_EXEC, 0));
+              prot_to_type(PROT_READ | PROT_EXEC, 0));
 
   sprint("KERN_BASE 0x%lx\n", lookup_pa(t_page_dir, KERN_BASE));
 
-  // also (direct) map remaining address space, to make them accessable from kernel.
-  // this is important when kernel needs to access the memory content of user's app
-  // without copying pages between kernel and user spaces.
-  kern_vm_map(t_page_dir, (uint64)_etext, (uint64)_etext, PHYS_TOP - (uint64)_etext,
-         prot_to_type(PROT_READ | PROT_WRITE, 0));
+  // also (direct) map remaining address space, to make them accessable from
+  // kernel. this is important when kernel needs to access the memory content of
+  // user's app without copying pages between kernel and user spaces.
+  kern_vm_map(t_page_dir, (uint64)_etext, (uint64)_etext,
+              PHYS_TOP - (uint64)_etext,
+              prot_to_type(PROT_READ | PROT_WRITE, 0));
 
-  sprint("physical address of _etext is: 0x%lx\n", lookup_pa(t_page_dir, (uint64)_etext));
+  sprint("physical address of _etext is: 0x%lx\n",
+         lookup_pa(t_page_dir, (uint64)_etext));
 
   g_kernel_pagetable = t_page_dir;
 }
 
 /* --- user page table part --- */
-
 //
-// convert and return the corresponding physical address of a virtual address (va) of
-// application.
+// convert and return the corresponding physical address of a virtual address
+// (va) of application.
 //
 void *user_va_to_pa(pagetable_t page_dir, void *va) {
-  // TODO (lab2_1): implement user_va_to_pa to convert a given user virtual address "va"
-  // to its corresponding physical address, i.e., "pa". To do it, we need to walk
-  // through the page table, starting from its directory "page_dir", to locate the PTE
-  // that maps "va". If found, returns the "pa" by using:
-  // pa = PYHS_ADDR(PTE) + (va - va & (1<<PGSHIFT -1))
-  // Here, PYHS_ADDR() means retrieving the starting address (4KB aligned), and
-  // (va - va & (1<<PGSHIFT -1)) means computing the offset of "va" in its page.
-  // Also, it is possible that "va" is not mapped at all. in such case, we can find
-  // invalid PTE, and should return NULL.
-  panic( "You have to implement user_va_to_pa (convert user va to pa) to print messages in lab2_1.\n" );
-
+  // TODO (lab2_1): implement user_va_to_pa to convert a given user virtual
+  // address "va" to its corresponding physical address, i.e., "pa". To do it,
+  // we need to walk through the page table, starting from its directory
+  // "page_dir", to locate the PTE that maps "va". If found, returns the "pa" by
+  // using: pa = PYHS_ADDR(PTE) + (va & (1<<PGSHIFT -1)) Here, PYHS_ADDR() means
+  // retrieving the starting address (4KB aligned), and (va & (1<<PGSHIFT -1))
+  // means computing the offset of "va" inside its page. Also, it is possible
+  // that "va" is not mapped at all. in such case, we can find invalid PTE, and
+  // should return NULL.
+  // panic( "You have to implement user_va_to_pa (convert user va to pa) to
+  // print messages in lab2_1.\n" );
+  uint64 va0 = (uint64)va;
+  pte_t *PTE = page_walk(page_dir, va0, 0);
+  uint64 pa = 0;
+  if (PTE) {
+    pa = PTE2PA(*PTE) + (va0 & ((1 << PGSHIFT) - 1));
+  }
+  return (void *)pa;
 }
 
 //
 // maps virtual address [va, va+sz] to [pa, pa+sz] (for user application).
 //
-void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa,
+                 int perm) {
   if (map_pages(page_dir, va, size, pa, perm) != 0) {
     panic("fail to user_vm_map .\n");
   }
@@ -175,13 +205,94 @@ void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int pe
 // reclaim the physical pages if free!=0
 //
 void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free) {
-  // TODO (lab2_2): implement user_vm_unmap to disable the mapping of the virtual pages
-  // in [va, va+size], and free the corresponding physical pages used by the virtual
-  // addresses when if free is not zero.
-  // basic idea here is to first locate the PTEs of the virtual pages, and then reclaim
-  // (use free_page() defined in pmm.c) the physical pages. lastly, invalidate the PTEs.
-  // as naive_free reclaims only one page at a time, you only need to consider one page
-  // to make user/app_naive_malloc to produce the correct hehavior.
-  panic( "You have to implement user_vm_unmap to free pages using naive_free in lab2_2.\n" );
+  // TODO (lab2_2): implement user_vm_unmap to disable the mapping of the
+  // virtual pages in [va, va+size], and free the corresponding physical pages
+  // used by the virtual addresses when if 'free' (the last parameter) is not
+  // zero. basic idea here is to first locate the PTEs of the virtual pages, and
+  // then reclaim (use free_page() defined in pmm.c) the physical pages. lastly,
+  // invalidate the PTEs. as naive_free reclaims only one page at a time, you
+  // only need to consider one page to make user/app_naive_malloc to behave
+  // correctly.
+  // panic( "You have to implement user_vm_unmap to free pages using naive_free
+  // in lab2_2.\n" );
+  pagetable_t PTE = page_walk(page_dir, va, 0);
+  if (PTE) {
+    free_page((void *)user_va_to_pa(page_dir, (void *)va));
+    *PTE = *PTE & (~PTE_V); // let valid to be 0
+  }
+}
 
+uint64 user_vm_alloc(pagetable_t pagetable, uint64 old, uint64 new) {
+  char *mem;
+  if (old > new)
+    return old;
+  old = PGROUNDUP(old);
+  for (uint64 o = old; o < new; o += PGSIZE) {
+    mem = (char *)alloc_page();
+    if (mem == 0)
+      panic("failed to user_vm_malloc .\n");
+    memset(mem, 0, sizeof(uint8) * PGSIZE);
+    map_pages(pagetable, old, PGSIZE, (uint64)mem,
+              prot_to_type(PROT_READ | PROT_WRITE, 1));
+  }
+  return new;
+}
+
+void heap_init() {
+  current->heap_sz = USER_FREE_ADDRESS_START;
+  uint64 addr = current->heap_sz;
+  add_heap_size(sizeof(memory_control_block));
+  pte_t *pte = page_walk(current->pagetable, addr, 0);
+  memory_control_block *head_block = (memory_control_block *)PTE2PA(*pte);
+  current->heap_start = (uint64)head_block;
+  head_block->next = head_block;
+  head_block->size = 0;
+  current->heap_end = (uint64)head_block;
+}
+
+uint64 malloc(int n) {
+  if (!init_heap) {
+    init_heap = 1;
+    heap_init();
+  }
+  memory_control_block *head = (memory_control_block *)current->heap_start;
+  memory_control_block *tail = (memory_control_block *)current->heap_end;
+  for (;;) {
+    if (head->size >= n && head->available == 1) {
+      head->available = 0;
+      return head->offset + sizeof(memory_control_block);
+    }
+    if (head->next == tail)
+      break;
+    head = head->next;
+  }
+  uint64 now_addr = current->heap_sz;
+  add_heap_size((uint64)(sizeof(memory_control_block) + n + 8));
+  pte_t *pte = page_walk(current->pagetable, now_addr, 0);
+  memory_control_block *now =
+      (memory_control_block *)(PTE2PA(*pte) + (now_addr & 0xfff));
+  uint64 magic = (8 - ((uint64)now % 8)) % 8;
+  now = (memory_control_block *)((uint64)now + magic);
+  now->available = 0;
+  now->offset = now_addr;
+  now->size = n;
+  now->next = head->next;
+  head->next = now;
+  head = (memory_control_block *)current->heap_start;
+  return now_addr + sizeof(memory_control_block);
+}
+
+void free_impl(void *addr) {
+  pte_t *pte = page_walk(current->pagetable, (uint64)(addr), 0);
+  memory_control_block *now =
+      (memory_control_block *)(PTE2PA(*pte) + ((uint64)addr & 0xfff));
+  uint64 magic = (8 - ((uint64)now % 8)) % 8;
+  now = (memory_control_block *)((uint64)now + magic);
+  if (now->available == 1)
+    panic("the memory has been freed.\n");
+  now->available = 1;
+}
+
+void free(void *addr) {
+  free_impl((void *)((uint64)addr - sizeof(memory_control_block)));
 }
